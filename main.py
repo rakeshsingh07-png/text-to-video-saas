@@ -4,15 +4,16 @@ import secrets
 import requests
 import subprocess
 from urllib.parse import quote_plus
-from typing import Optional
+from typing import Optional, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
+from gtts import gTTS
 import razorpay
+import replicate
 
-# --- Load Environment Variables ---
 load_dotenv()
 
 raw_password = os.getenv("DB_PASSWORD", "Rak@jan940940")
@@ -20,7 +21,6 @@ safe_password = quote_plus(raw_password)
 DB_URL = f"postgresql+psycopg2://postgres:{safe_password}@localhost:5432/videodb"
 engine = create_engine(DB_URL)
 
-# Ensure license table exists
 with engine.begin() as conn:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS licenses (
@@ -33,16 +33,34 @@ with engine.begin() as conn:
         );
     """))
 
-# Third-Party Keys
 PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "58338490-5961215e8f19194db51131039")
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "rzp_live_Tuq9tSa5YrP9fE")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "b32F0RGv7MGB1nC1sS7x9eqq")
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
 
 rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
-app = FastAPI(title="Text-to-Video Engine SaaS")
+app = FastAPI(title="Global Text-to-Video Creator Studio")
 
-# --- Content Moderation & Legal Safety Filter ---
+AVATAR_PRESETS = {
+    "devotional": {
+        "name": "Aarav - Cultural & Spiritual",
+        "url": "https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?auto=format&fit=crop&w=400&q=80"
+    },
+    "business": {
+        "name": "Sarah - Executive Anchor",
+        "url": "https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&w=400&q=80"
+    },
+    "tech": {
+        "name": "Alex - Tech Specialist",
+        "url": "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=400&q=80"
+    },
+    "creative": {
+        "name": "Leo - Creator Host",
+        "url": "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=400&q=80"
+    }
+}
+
 BLOCKED_PATTERNS = [
     r"\b(porn|pornography|nude|nudity|sex|erotic|nsfw|xxx)\b",
     r"\b(kill|murder|assassinate|suicide|terror|terrorist|bomb|explosive)\b",
@@ -53,25 +71,24 @@ BLOCKED_PATTERNS = [
 ]
 
 def sanitize_and_validate_prompt(prompt: str) -> str:
-    """Validates that input strictly complies with safety and legal ethics."""
     clean_text = prompt.strip()
     if not clean_text:
-        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
-    
-    if len(clean_text) > 400:
-        raise HTTPException(status_code=400, detail="Prompt exceeds maximum length of 400 characters.")
-    
+        raise HTTPException(status_code=400, detail="Script/prompt cannot be empty.")
+    if len(clean_text) > 2500:
+        raise HTTPException(status_code=400, detail="Script exceeds 2,500 characters limit.")
     for pattern in BLOCKED_PATTERNS:
         if re.search(pattern, clean_text, re.IGNORECASE):
             raise HTTPException(
                 status_code=400,
-                detail="[Content Moderation Alert] Prompt blocked. Content containing explicit, violent, abusive, defamatory, or unlawful themes violates our Acceptable Use Policy."
+                detail="[Content Moderation Alert] Prompt blocked under international safety terms."
             )
-    
     return clean_text
 
 class GenerateRequest(BaseModel):
     prompt: str
+    language: Optional[str] = "en"
+    character: Optional[str] = "devotional"
+    engine_mode: Optional[str] = "stock"  # "generative" or "stock"
     license_key: Optional[str] = None
     user_id: Optional[str] = None
 
@@ -88,35 +105,91 @@ class VerifyPaymentRequest(BaseModel):
 
 job_tracker = {}
 
-def generate_voiceover(script_text, audio_output="voice.wav"):
-    clean_text = script_text.replace('"', '').replace("'", "")
-    abs_audio = os.path.abspath(audio_output)
-    ps_cmd = (
-        f'Add-Type -AssemblyName System.Speech; '
-        f'$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; '
-        f'$synth.SetOutputToWaveFile("{abs_audio}"); '
-        f'$synth.Speak("{clean_text}"); '
-        f'$synth.Dispose()'
-    )
-    subprocess.run(["powershell", "-Command", ps_cmd], check=True)
-    return abs_audio
-
-def download_pixabay_video(query, video_output="raw_broll.mp4"):
-    clean_q = "".join(ch for ch in query if ch.isalnum() or ch.isspace()).strip()
-    words = clean_q.split()
+def ensure_avatar_asset(avatar_key: str) -> str:
+    key = avatar_key.lower() if avatar_key in AVATAR_PRESETS else "devotional"
+    local_path = os.path.abspath(f"avatar_{key}.jpg")
     
-    candidates = [clean_q]
-    if len(words) > 1:
-        candidates.extend(words)
-    candidates.extend(["technology", "nature", "success", "business"])
+    if not os.path.exists(local_path) or os.path.getsize(local_path) < 2000:
+        url = AVATAR_PRESETS[key]["url"]
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(url, headers=headers, timeout=8)
+            if r.status_code == 200 and len(r.content) > 2000:
+                with open(local_path, "wb") as f:
+                    f.write(r.content)
+        except Exception:
+            pass
+
+    if not os.path.exists(local_path) or os.path.getsize(local_path) < 2000:
+        cmd = [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=0x0284c7:s=220x220:d=1",
+            "-frames:v", "1", local_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+    return local_path
+
+def generate_voiceover(script_text: str, audio_output: str, lang: str = "en") -> str:
+    abs_audio = os.path.abspath(audio_output)
+    clean_text = script_text.replace('"', '').replace("'", "").strip()
+    
+    try:
+        tts = gTTS(text=clean_text, lang=lang, slow=False)
+        temp_mp3 = abs_audio + ".mp3"
+        tts.save(temp_mp3)
+        cmd = ["ffmpeg", "-y", "-i", temp_mp3, "-acodec", "pcm_s16le", "-ar", "24000", abs_audio]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(temp_mp3):
+            os.remove(temp_mp3)
+        return abs_audio
+    except Exception as e:
+        ps_cmd = (
+            f'Add-Type -AssemblyName System.Speech; '
+            f'$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; '
+            f'$synth.SetOutputToWaveFile("{abs_audio}"); '
+            f'$synth.Speak("{clean_text}"); '
+            f'$synth.Dispose()'
+        )
+        subprocess.run(["powershell", "-Command", ps_cmd], check=True)
+        return abs_audio
+
+def generate_ai_video_replicate(prompt: str, video_output: str) -> str:
+    """Invokes generative AI video models via Replicate when enabled."""
+    if not REPLICATE_API_TOKEN:
+        return download_pixabay_video(prompt, video_output)
+    
+    try:
+        print(f"[REPLICATE AI] Synthesizing generative video for: {prompt[:60]}...")
+        output = replicate.run(
+            "minimax/video-01",
+            input={"prompt": prompt, "prompt_optimizer": True}
+        )
+        video_url = str(output)
+        r = requests.get(video_url, stream=True, timeout=20)
+        with open(video_output, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=1024 * 512):
+                if chunk:
+                    f.write(chunk)
+        return os.path.abspath(video_output)
+    except Exception as e:
+        print(f"[Replicate Fallback to Pixabay] {e}")
+        return download_pixabay_video(prompt, video_output)
+
+def download_pixabay_video(query: str, video_output: str) -> str:
+    has_non_ascii = any(ord(c) > 127 for c in query)
+    if has_non_ascii:
+        search_terms = ["sunrise", "ocean", "temple", "nature"]
+    else:
+        clean_q = "".join(ch for ch in query if ch.isalnum() or ch.isspace()).strip()
+        search_terms = [clean_q, "cinematic ocean", "divine light", "nature"]
 
     hits = []
-    for term in candidates:
+    for term in search_terms:
         if not term or len(term) < 3:
             continue
-        url = f"https://pixabay.com/api/videos/?key={PIXABAY_API_KEY}&q={term}&per_page=3"
+        url = f"https://pixabay.com/api/videos/?key={PIXABAY_API_KEY}&q={quote_plus(term)}&per_page=3"
         try:
-            res = requests.get(url, timeout=5).json()
+            res = requests.get(url, timeout=6).json()
             hits = res.get('hits', [])
             if hits:
                 break
@@ -124,11 +197,10 @@ def download_pixabay_video(query, video_output="raw_broll.mp4"):
             continue
 
     if not hits:
-        url = f"https://pixabay.com/api/videos/?key={PIXABAY_API_KEY}&per_page=3"
-        hits = requests.get(url, timeout=5).json().get('hits', [])
+        url = f"https://pixabay.com/api/videos/?key={PIXABAY_API_KEY}&q=ocean&per_page=3"
+        hits = requests.get(url, timeout=6).json().get('hits', [])
 
-    videos_meta = hits[0]['videos']
-    selected_clip = videos_meta.get('tiny') or videos_meta.get('small') or videos_meta.get('medium')
+    selected_clip = hits[0]['videos'].get('small') or hits[0]['videos'].get('tiny') or hits[0]['videos'].get('medium')
     download_url = selected_clip['url']
 
     r = requests.get(download_url, stream=True, timeout=10)
@@ -138,86 +210,160 @@ def download_pixabay_video(query, video_output="raw_broll.mp4"):
                 f.write(chunk)
     return os.path.abspath(video_output)
 
-def assemble_video(video_file, audio_file, output_file, caption_text, is_demo=False):
-    clean_caption = caption_text.replace(":", "\\:").replace("'", "").replace('"', '')
-    font_path = "C\\:/Windows/Fonts/arial.ttf"
-    
-    caption_filter = (
-        f"drawtext=fontfile='{font_path}':text='{clean_caption}':"
-        f"fontcolor=white:fontsize=26:box=1:boxcolor=black@0.6:boxborderw=8:"
-        f"x=(w-text_w)/2:y=h-text_h-40"
+def render_scene(broll_file: str, audio_file: str, avatar_file: str, output_file: str, caption_text: str, is_demo: bool = False) -> str:
+    caption_txt_file = os.path.abspath(output_file + "_cap.txt")
+    with open(caption_txt_file, "w", encoding="utf-8") as f:
+        f.write(caption_text.strip())
+
+    safe_txt_path = caption_txt_file.replace("\\", "/").replace(":", "\\:")
+
+    possible_fonts = [
+        "C\\:/Windows/Fonts/Nirmala.ttf",
+        "C\\:/Windows/Fonts/mangal.ttf",
+        "C\\:/Windows/Fonts/arial.ttf"
+    ]
+    font_path = possible_fonts[0]
+    for pf in possible_fonts:
+        if os.path.exists(pf.replace("\\:", ":")):
+            font_path = pf
+            break
+
+    filter_complex = (
+        f"[0:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720[bg]; "
+        f"[1:v]scale=200:200[avatar]; "
+        f"[bg][avatar]overlay=W-w-30:H-h-30[vpip]; "
+        f"[vpip]drawtext=fontfile='{font_path}':textfile='{safe_txt_path}':"
+        f"fontcolor=white:fontsize=22:box=1:boxcolor=black@0.65:boxborderw=6:"
+        f"x=(w-text_w)/2:y=h-text_h-25,"
+        f"drawtext=fontfile='{font_path}':text='[AI SYNTHETIC MEDIA - DISCLOSED]':fontcolor=white@0.6:fontsize=12:x=20:y=20"
     )
-    
+
     if is_demo:
-        filter_str = f"{caption_filter},drawtext=fontfile='{font_path}':text='FREE DEMO PREVIEW':fontcolor=yellow@0.8:fontsize=32:x=(w-text_w)/2:y=40"
-        duration_arg = ["-t", "3"]
+        filter_complex += f",drawtext=fontfile='{font_path}':text='FREE DEMO PREVIEW':fontcolor=yellow@0.9:fontsize=32:x=(w-text_w)/2:y=50[vout]"
+        duration_arg = ["-t", "6"]
     else:
-        filter_str = caption_filter
+        filter_complex += "[vout]"
         duration_arg = ["-shortest"]
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", video_file,
+        "-stream_loop", "-1", "-i", broll_file,
+        "-loop", "1", "-i", avatar_file,
         "-i", audio_file,
-        "-vf", filter_str,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "2:a",
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-tune", "zerolatency",
         "-threads", "0",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "192k",
         *duration_arg,
         "-pix_fmt", "yuv420p",
         output_file
     ]
     subprocess.run(cmd, check=True)
+
+    if os.path.exists(caption_txt_file):
+        try: os.remove(caption_txt_file)
+        except Exception: pass
+
     return output_file
 
-def process_job(user_id: Optional[str], prompt: str, job_id: str, is_demo: bool):
-    try:
-        print(f"\n--- [START] Rendering Job: {job_id} ---")
-        audio_path = generate_voiceover(prompt, f"voice_{job_id}.wav")
-        raw_video = download_pixabay_video(prompt, f"broll_{job_id}.mp4")
-        output_filename = f"video_{job_id[:8]}.mp4"
-        assemble_video(raw_video, audio_path, output_filename, prompt, is_demo=is_demo)
+def split_script_into_scenes(script: str) -> List[str]:
+    raw_sentences = re.split(r'(?<=[.!?|।])\s+', script.strip())
+    scenes = [s.strip() for s in raw_sentences if len(s.strip()) > 3]
+    return scenes if scenes else [script.strip()]
 
-        job_tracker[job_id] = {"status": "COMPLETED", "path": output_filename}
+def process_job(user_id: Optional[str], prompt: str, character_choice: str, language_choice: str, engine_mode: str, job_id: str, is_demo: bool):
+    temp_files = []
+    try:
+        print(f"\n--- [START] Rendering ({engine_mode.upper()}) Job: {job_id} ---")
+        scenes = split_script_into_scenes(prompt)
+        avatar_path = ensure_avatar_asset(character_choice)
+        
+        render_scenes = scenes[:1] if is_demo else scenes
+        scene_video_paths = []
+
+        for idx, scene_text in enumerate(render_scenes):
+            s_audio = f"temp_aud_{job_id}_{idx}.wav"
+            s_broll = f"temp_broll_{job_id}_{idx}.mp4"
+            s_scene_out = f"scene_{job_id}_{idx}.mp4"
+            temp_files.extend([s_audio, s_broll])
+
+            generate_voiceover(scene_text, s_audio, lang=language_choice)
+
+            if engine_mode == "generative" and not is_demo:
+                generate_ai_video_replicate(scene_text, s_broll)
+            else:
+                download_pixabay_video(scene_text, s_broll)
+
+            render_scene(s_broll, s_audio, avatar_path, s_scene_out, scene_text, is_demo=is_demo)
+            scene_video_paths.append(s_scene_out)
+
+        final_video = f"video_{job_id[:8]}.mp4"
+        if len(scene_video_paths) == 1:
+            if os.path.exists(final_video): os.remove(final_video)
+            os.rename(scene_video_paths[0], final_video)
+        else:
+            concat_list = f"concat_{job_id}.txt"
+            temp_files.append(concat_list)
+            with open(concat_list, "w", encoding="utf-8") as f:
+                for sv in scene_video_paths:
+                    f.write(f"file '{os.path.abspath(sv).replace(chr(92), '/')}'\n")
+            
+            cmd = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", concat_list,
+                "-c", "copy",
+                final_video
+            ]
+            subprocess.run(cmd, check=True)
+            for sv in scene_video_paths:
+                if os.path.exists(sv): os.remove(sv)
+
+        job_tracker[job_id] = {"status": "COMPLETED", "path": final_video}
 
         if user_id:
             with engine.begin() as conn:
                 conn.execute(
                     text("INSERT INTO video_jobs (user_id, prompt, status, video_path) VALUES (:u_id, :prompt, 'COMPLETED', :path)"),
-                    {"u_id": user_id, "prompt": prompt, "path": output_filename}
+                    {"u_id": user_id, "prompt": prompt, "path": final_video}
                 )
 
-        if os.path.exists(audio_path): 
-            os.remove(audio_path)
-        if os.path.exists(raw_video): 
-            os.remove(raw_video)
-        print(f"--- [DONE] Video Ready: {output_filename} ---\n")
+        print(f"--- [DONE] Video Ready: {final_video} ---\n")
     except Exception as e:
         print(f"[ERROR in Job {job_id}] {e}")
         job_tracker[job_id] = {"status": "FAILED", "path": None}
         if user_id:
             with engine.begin() as conn:
                 conn.execute(text("UPDATE users SET credits = credits + 1 WHERE user_id = :u_id"), {"u_id": user_id})
+    finally:
+        for tf in temp_files:
+            if os.path.exists(tf):
+                try: os.remove(tf)
+                except Exception: pass
 
 @app.get("/", response_class=HTMLResponse)
 def index_page():
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>AI Video Generator & Payment Gateway</title>
+    <title>Global AI Video Studio & Multilingual Engine</title>
     <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 30px; line-height: 1.5; }}
-        .container {{ max-width: 820px; margin: auto; }}
-        .card {{ background: #1e293b; padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); margin-bottom: 25px; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b0f19; color: #f8fafc; padding: 25px; line-height: 1.5; }}
+        .container {{ max-width: 860px; margin: auto; }}
+        .card {{ background: #131d31; padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); margin-bottom: 25px; border: 1px solid #1e293b; }}
         h2, h3 {{ margin-top: 0; color: #38bdf8; }}
-        label {{ font-size: 13px; font-weight: 600; color: #94a3b8; display: block; margin-top: 12px; }}
-        input, textarea {{ width: 100%; padding: 10px; margin-top: 5px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; }}
-        button {{ width: 100%; margin-top: 15px; padding: 12px; background: #0284c7; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 15px; }}
+        label {{ font-size: 13px; font-weight: 600; color: #94a3b8; display: block; margin-top: 14px; }}
+        input, textarea, select {{ width: 100%; padding: 11px; margin-top: 5px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; }}
+        button {{ width: 100%; margin-top: 15px; padding: 13px; background: #0284c7; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 15px; }}
         button:hover {{ background: #0369a1; }}
+        .avatar-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 8px; }}
+        .avatar-card {{ background: #0f172a; border: 2px solid #334155; border-radius: 8px; padding: 8px; text-align: center; cursor: pointer; font-size: 12px; }}
+        .avatar-card.selected {{ border-color: #38bdf8; background: #1e3a5f; }}
         .pricing-grid {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-top: 15px; }}
         .plan-box {{ background: #0f172a; border: 2px solid #334155; border-radius: 8px; padding: 15px; text-align: center; cursor: pointer; }}
         .plan-box.selected {{ border-color: #38bdf8; background: #1e3a5f; }}
@@ -226,111 +372,132 @@ def index_page():
         .success {{ background: #064e3b; color: #6ee7b7; border: 1px solid #059669; }}
         .error {{ background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }}
         video {{ width: 100%; border-radius: 8px; margin-top: 15px; }}
-        
-        .disclaimer-card {{
-            background: #111827;
-            border: 1px solid #374151;
-            padding: 20px;
-            border-radius: 8px;
-            font-size: 12px;
-            color: #9ca3af;
-            line-height: 1.6;
-        }}
-        .disclaimer-card h4 {{
-            margin: 0 0 8px 0;
-            color: #e5e7eb;
-            font-size: 13px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }}
-        .disclaimer-list {{
-            margin: 8px 0 0 16px;
-            padding: 0;
-        }}
+        .disclaimer-card {{ background: #090d16; border: 1px solid #374151; padding: 20px; border-radius: 8px; font-size: 12px; color: #9ca3af; line-height: 1.6; }}
+        .disclaimer-card h4 {{ margin: 0 0 8px 0; color: #e5e7eb; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .disclaimer-list {{ margin: 8px 0 0 16px; padding: 0; }}
     </style>
 </head>
 <body>
 <div class="container">
     <div class="card">
-        <h2>Text-to-Video SaaS Engine</h2>
+        <h2>Global Text-to-Video Creator Studio</h2>
         <div style="display:flex; justify-content:space-between; align-items:center;">
             <span id="quotaInfo" style="font-size:13px; color:#cbd5e1;">Free Demos Remaining: <strong>3/3</strong></span>
-            <span style="font-size:12px; color:#10b981; font-weight:600;">✓ Automated Safety Guardrails Active</span>
+            <span style="font-size:12px; color:#10b981; font-weight:600;">✓ Generative AI Pipeline Available</span>
         </div>
 
-        <label>Video Script / Prompt</label>
-        <textarea id="prompt" rows="3" placeholder="Enter ethical video script or concept...">Deepak I made it now anyone can use it</textarea>
+        <label>Visual Engine Mode</label>
+        <select id="engineMode">
+            <option value="stock" selected>Stock Visual Engine (Fast & Cost-Efficient)</option>
+            <option value="generative">Cinematic Generative AI (Runway/MiniMax via Replicate)</option>
+        </select>
+
+        <label>Select Video Language / भाषा चुनें</label>
+        <select id="languageSelect">
+            <option value="en" selected>English (US/UK) - Global English</option>
+            <option value="hi">Hindi (हिन्दी) - Native Hindi Voice</option>
+            <option value="es">Spanish (Español)</option>
+            <option value="fr">French (Français)</option>
+            <option value="de">German (Deutsch)</option>
+        </select>
+
+        <label>Select In-Built Character Presenter</label>
+        <div class="avatar-grid">
+            <div id="av_devotional" class="avatar-card selected" onclick="selectAvatar('devotional')">
+                <strong>Aarav</strong><br><span style="color:#94a3b8;">Spiritual & Cultural</span>
+            </div>
+            <div id="av_business" class="avatar-card" onclick="selectAvatar('business')">
+                <strong>Sarah</strong><br><span style="color:#94a3b8;">Executive Anchor</span>
+            </div>
+            <div id="av_tech" class="avatar-card" onclick="selectAvatar('tech')">
+                <strong>Alex</strong><br><span style="color:#94a3b8;">Tech Specialist</span>
+            </div>
+            <div id="av_creative" class="avatar-card" onclick="selectAvatar('creative')">
+                <strong>Leo</strong><br><span style="color:#94a3b8;">Creator Host</span>
+            </div>
+        </div>
+
+        <label>Script & Narration</label>
+        <textarea id="prompt" rows="4">From the infinite cosmic waters came the first avatar of Lord Vishnu, Matsya. He arrived not only to protect the sacred Vedas, but to ignite the sacred journey of life itself. From the deep primal ocean, divine grace guided creation onto land, igniting the evolution of all living beings on Earth.</textarea>
         
-        <label>License Key (Optional - Leave blank for Free Demo)</label>
+        <label>Creator License Key (Optional - Leave blank for Free Demo)</label>
         <input type="text" id="licenseKey" value="E68D-AB69-E521-C669" />
 
         <button id="genBtn" onclick="submitVideo()">Generate Video</button>
         <div id="status"></div>
         <div id="videoBox" style="display:none; text-align:center;">
-            <h4 style="color:#38bdf8; margin: 10px 0 0 0;">Generated Output</h4>
-            <video id="player" controls autoplay></video>
+            <h4 style="color:#38bdf8; margin: 10px 0 0 0;">Generated Production Output</h4>
+            <video id="player" controls autoplay playsinline style="width: 100%; max-height: 420px;"></video>
         </div>
     </div>
 
     <div class="card">
-        <h3>Purchase License & Top-Up Credits</h3>
-        <p style="color:#94a3b8; font-size:14px; margin-top:0;">Direct settlement via UPI, Card, or Net Banking into your bank account.</p>
+        <h3>Creator Commercial Plans & Global Top-Up</h3>
+        <p style="color:#94a3b8; font-size:14px; margin-top:0;">Direct settlement via UPI, Global Cards, and Net Banking.</p>
         
         <label>Subscriber User ID</label>
         <input type="text" id="payUserId" value="b59fa494-2256-4625-8ece-d8884d89502f" />
 
         <div class="pricing-grid">
-            <div id="planTest" class="plan-box selected" onclick="selectPlan('test')">
-                <span class="badge" style="background:#10b981; color:#fff;">TEST PLAN</span>
-                <h4 style="margin:10px 0;">5 Videos</h4>
-                <p style="color:#38bdf8; font-weight:bold; font-size:18px;">₹10</p>
-            </div>
-            <div id="planStarter" class="plan-box" onclick="selectPlan('starter')">
-                <span class="badge">STARTER</span>
-                <h4 style="margin:10px 0;">50 Videos</h4>
-                <p style="color:#38bdf8; font-weight:bold; font-size:18px;">₹499</p>
+            <div id="planCreator" class="plan-box selected" onclick="selectPlan('creator')">
+                <span class="badge" style="background:#10b981; color:#fff;">CREATOR LITE</span>
+                <h4 style="margin:10px 0;">25 Long Videos</h4>
+                <p style="color:#38bdf8; font-weight:bold; font-size:18px;">₹999 <span style="font-size:12px; color:#94a3b8;">(~$12)</span></p>
             </div>
             <div id="planPro" class="plan-box" onclick="selectPlan('pro')">
-                <span class="badge">PRO VALUE</span>
-                <h4 style="margin:10px 0;">200 Videos</h4>
-                <p style="color:#38bdf8; font-weight:bold; font-size:18px;">₹1,499</p>
+                <span class="badge">PRO CREATOR</span>
+                <h4 style="margin:10px 0;">100 Long Videos</h4>
+                <p style="color:#38bdf8; font-weight:bold; font-size:18px;">₹2,499 <span style="font-size:12px; color:#94a3b8;">(~$30)</span></p>
+            </div>
+            <div id="planStudio" class="plan-box" onclick="selectPlan('studio')">
+                <span class="badge">STUDIO GLOBAL</span>
+                <h4 style="margin:10px 0;">300 Long Videos</h4>
+                <p style="color:#38bdf8; font-weight:bold; font-size:18px;">₹5,999 <span style="font-size:12px; color:#94a3b8;">(~$75)</span></p>
             </div>
         </div>
 
-        <button style="background:#10b981;" onclick="payWithRazorpay()">Pay Securely via UPI / Card</button>
+        <button style="background:#10b981;" onclick="payWithRazorpay()">Subscribe & Upgrade Credits</button>
         <div id="payStatus"></div>
     </div>
 
     <div class="disclaimer-card">
-        <h4>Legal Compliance, Acceptable Use & Liability Disclaimer</h4>
+        <h4>International Legal Compliance, Synthetic Media & Safe Harbor Terms</h4>
         <p style="margin:0 0 8px 0;">
-            This software functions strictly as an automated processing utility. By submitting prompts or generating media, you acknowledge and agree to the following statutory conditions:
+            This software operates as an automated digital rendering pipeline. By generating media on this service, you legally agree to:
         </p>
         <ul class="disclaimer-list">
-            <li><strong>Automated Ethical Filtering:</strong> The system automatically blocks content involving defamation, nudity/sexual exploitation, violence, illegal substances, hate speech, national security threats, copyright infringements, or cyber-harassment.</li>
-            <li><strong>User Liability:</strong> The end-user retains full legal accountability for all submitted text prompts and downstream distribution of generated video/audio files under applicable Information Technology and telecommunication statutes.</li>
-            <li><strong>Platform Indemnification:</strong> The platform owners, service operators, and infrastructure providers are held entirely harmless and exempt from civil or criminal liability resulting from willful misuse, third-party intellectual property breaches, or deceptive claims generated by users.</li>
+            <li><strong>EU AI Act Article 50 Compliance:</strong> All generated media carries automated digital transparency watermarks disclosing synthetic AI voice and character composition.</li>
+            <li><strong>Automated Ethical Filtering:</strong> Strictly blocks content containing harassment, defamation, intellectual property theft, deepfake deception, violence, illegal drugs, or hate speech.</li>
+            <li><strong>Global Safe Harbor & User Liability:</strong> The creator retains sole civil and criminal accountability for script inputs, publication, and distribution under US DMCA, Indian IT Act, and EU Digital Services frameworks.</li>
         </ul>
     </div>
 </div>
 
 <script>
-    let selectedPlan = 'test';
+    let selectedPlan = 'creator';
+    let selectedAvatar = 'devotional';
     let demoCount = 0;
     const rzpKeyId = "{RAZORPAY_KEY_ID}";
 
+    function selectAvatar(av) {{
+        selectedAvatar = av;
+        ['devotional', 'business', 'tech', 'creative'].forEach(a => {{
+            document.getElementById('av_' + a).classList.toggle('selected', a === av);
+        }});
+    }}
+
     function selectPlan(plan) {{
         selectedPlan = plan;
-        document.getElementById('planTest').classList.toggle('selected', plan === 'test');
-        document.getElementById('planStarter').classList.toggle('selected', plan === 'starter');
+        document.getElementById('planCreator').classList.toggle('selected', plan === 'creator');
         document.getElementById('planPro').classList.toggle('selected', plan === 'pro');
+        document.getElementById('planStudio').classList.toggle('selected', plan === 'studio');
     }}
 
     async function payWithRazorpay() {{
         const payStatus = document.getElementById('payStatus');
         payStatus.style.display = 'block';
         payStatus.className = '';
-        payStatus.innerText = 'Creating payment order...';
+        payStatus.innerText = 'Initializing secure payment order...';
 
         const userId = document.getElementById('payUserId').value;
         const res = await fetch('/create-order', {{
@@ -341,7 +508,7 @@ def index_page():
         const orderData = await res.json();
         if (!res.ok) {{
             payStatus.className = 'error';
-            payStatus.innerText = orderData.detail || 'Could not initiate payment.';
+            payStatus.innerText = orderData.detail || 'Could not initiate checkout.';
             return;
         }}
 
@@ -349,11 +516,11 @@ def index_page():
             "key": rzpKeyId,
             "amount": orderData.amount,
             "currency": "INR",
-            "name": "Text-to-Video Engine",
-            "description": selectedPlan.toUpperCase() + " Plan License",
+            "name": "Global Video Creator Studio",
+            "description": selectedPlan.toUpperCase() + " Commercial License",
             "order_id": orderData.order_id,
             "handler": async function (response) {{
-                payStatus.innerText = 'Verifying payment with bank...';
+                payStatus.innerText = 'Verifying settlement with bank...';
                 const verifyRes = await fetch('/verify-payment', {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
@@ -368,7 +535,7 @@ def index_page():
                 const verifyData = await verifyRes.json();
                 if (verifyRes.ok) {{
                     payStatus.className = 'success';
-                    payStatus.innerHTML = `<strong>Payment Received!</strong><br>License Key: <code style="color:#38bdf8; font-weight:bold;">${{verifyData.license_key}}</code><br>Credits Added: +${{verifyData.credits}}<br><em>Key automatically filled into the generator!</em>`;
+                    payStatus.innerHTML = `<strong>Payment Confirmed!</strong><br>License Key: <code style="color:#38bdf8; font-weight:bold;">${{verifyData.license_key}}</code><br>Credits Added: +${{verifyData.credits}}<br><em>Key automatically filled into the studio generator!</em>`;
                     document.getElementById('licenseKey').value = verifyData.license_key;
                 }} else {{
                     payStatus.className = 'error';
@@ -387,12 +554,14 @@ def index_page():
         const btn = document.getElementById('genBtn');
         const license = document.getElementById('licenseKey').value.trim();
         const prompt = document.getElementById('prompt').value.trim();
+        const lang = document.getElementById('languageSelect').value;
+        const mode = document.getElementById('engineMode').value;
 
-        if (!prompt) return alert('Please enter a video prompt');
+        if (!prompt) return alert('Please enter a video prompt or script');
 
         status.style.display = 'block';
         status.className = '';
-        status.innerText = 'Checking content safety & submitting job...';
+        status.innerText = 'Moderating script & processing video...';
         videoBox.style.display = 'none';
         btn.disabled = true;
 
@@ -402,6 +571,9 @@ def index_page():
                 headers: {{'Content-Type': 'application/json'}},
                 body: JSON.stringify({{
                     prompt: prompt,
+                    language: lang,
+                    character: selectedAvatar,
+                    engine_mode: mode,
                     license_key: license || null,
                     user_id: document.getElementById('payUserId').value
                 }})
@@ -415,7 +587,7 @@ def index_page():
             }}
 
             status.className = 'success';
-            status.innerHTML = `<strong>${{data.is_demo ? 'Rendering 3s Demo Clip' : 'Rendering Full Video'}}...</strong><br>Job ID: ${{data.job_id}}`;
+            status.innerHTML = `<strong>Rendering ${{data.is_demo ? 'Demo Preview' : 'Production Video'}}...</strong><br>Job ID: ${{data.job_id}}`;
             poll(data.job_id);
         }} catch (err) {{
             status.className = 'error';
@@ -431,20 +603,23 @@ def index_page():
                 const data = await res.json();
                 if (data.status === 'COMPLETED') {{
                     clearInterval(timer);
-                    document.getElementById('status').innerHTML = '<strong>Render Complete!</strong>';
-                    document.getElementById('player').src = `/download/${{data.video_path}}`;
+                    document.getElementById('status').innerHTML = '<strong>Production Video Ready!</strong>';
+                    const player = document.getElementById('player');
+                    player.src = `/download/${{data.video_path}}`;
+                    player.muted = false;
+                    player.volume = 1.0;
                     document.getElementById('videoBox').style.display = 'block';
                     document.getElementById('genBtn').disabled = false;
                 }} else if (data.status === 'FAILED') {{
                     clearInterval(timer);
                     document.getElementById('status').className = 'error';
-                    document.getElementById('status').innerText = 'Generation encountered an error.';
+                    document.getElementById('status').innerText = 'Generation encountered an error during scene rendering.';
                     document.getElementById('genBtn').disabled = false;
                 }}
             }} catch (err) {{
                 console.error("Polling error:", err);
             }}
-        }}, 2000);
+        }}, 2500);
     }}
 </script>
 </body>
@@ -452,8 +627,8 @@ def index_page():
 
 @app.post("/create-order")
 def create_order(req: CreateOrderRequest):
-    plan_prices = {"test": 1000, "starter": 49900, "pro": 149900}
-    amount = plan_prices.get(req.plan.lower(), 1000)
+    plan_prices = {"creator": 99900, "pro": 249900, "studio": 599900}
+    amount = plan_prices.get(req.plan.lower(), 99900)
 
     try:
         order = rzp_client.order.create({
@@ -476,8 +651,8 @@ def verify_payment(req: VerifyPaymentRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid payment verification signature.")
 
-    credits_map = {"test": 5, "starter": 50, "pro": 200}
-    credits = credits_map.get(req.plan.lower(), 5)
+    credits_map = {"creator": 25, "pro": 100, "studio": 300}
+    credits = credits_map.get(req.plan.lower(), 25)
     raw_token = secrets.token_hex(8).upper()
     license_key = f"{raw_token[:4]}-{raw_token[4:8]}-{raw_token[8:12]}-{raw_token[12:]}"
 
@@ -499,11 +674,13 @@ def verify_payment(req: VerifyPaymentRequest):
 @app.post("/generate")
 def generate_endpoint(req: GenerateRequest, background_tasks: BackgroundTasks):
     validated_prompt = sanitize_and_validate_prompt(req.prompt)
+    character_choice = req.character or "devotional"
+    language_choice = req.language or "en"
+    engine_mode = req.engine_mode or "stock"
 
     job_id = secrets.token_hex(8)
     job_tracker[job_id] = {"status": "PROCESSING", "path": None}
     
-    # Paid License Path
     if req.license_key:
         with engine.begin() as conn:
             user = conn.execute(
@@ -511,18 +688,17 @@ def generate_endpoint(req: GenerateRequest, background_tasks: BackgroundTasks):
                 {"u_id": req.user_id}
             ).fetchone()
             if not user or user[0] <= 0:
-                raise HTTPException(status_code=402, detail="Credits exhausted. Please purchase a top-up.")
+                raise HTTPException(status_code=402, detail="Credits exhausted. Please top up your subscription.")
             
             conn.execute(
                 text("UPDATE users SET credits = credits - 1 WHERE user_id = :u_id"),
                 {"u_id": req.user_id}
             )
         
-        background_tasks.add_task(process_job, req.user_id, validated_prompt, job_id, is_demo=False)
+        background_tasks.add_task(process_job, req.user_id, validated_prompt, character_choice, language_choice, engine_mode, job_id, is_demo=False)
         return {"job_id": job_id, "is_demo": False}
 
-    # Free Demo Path
-    background_tasks.add_task(process_job, None, validated_prompt, job_id, is_demo=True)
+    background_tasks.add_task(process_job, None, validated_prompt, character_choice, language_choice, "stock", job_id, is_demo=True)
     return {"job_id": job_id, "is_demo": True}
 
 @app.get("/status/{job_id}")
